@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# Run the lint.sh script and capture the exit status
+./scripts/lint.sh
+lint_exit_code=$?
+
+# Check if the exit status is non-zero, and if so, reject the commit
+if [ $lint_exit_code -ne 0 ]; then
+  echo "Lint check failed. Please fix the issues before committing."
+  exit 1
+fi
