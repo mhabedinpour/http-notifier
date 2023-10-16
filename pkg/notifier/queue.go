@@ -84,14 +84,12 @@ type Queue[T Notification, R any] struct {
 	successes chan QueueSuccess[T, R]
 	// ctxCancelFunc is used for stopping worker goroutines.
 	ctxCancelFunc context.CancelFunc
-	// workersWaitGroup is used to make sure all worker goroutines are done when stopping the queue.
-	workersWaitGroup sync.WaitGroup
-	// retryHandlersWaitGroup is used to make sure all retry handler goroutines are done when stopping the queue.
-	retryHandlersWaitGroup sync.WaitGroup
 	// retryHandler can be used to retry failed notifications. This function should return how much to wait before retrying a failed Notification, Return NoRetry to stop retrying. Set this to nil to disable retrying.
 	retryHandler retryhandler.RetryHandler[T]
 	// circuitBreaker is used to implement the Circuit Breaker pattern and avoid cascading failures when writer is down.
 	circuitBreaker circuitbreaker.CircuitBreaker[R]
+	// doneChannel is used in Stop to make sure all goroutines are completely done.
+	doneChannel chan struct{}
 }
 
 // Errors is used to get the channel for reading errors by the client.
@@ -126,7 +124,7 @@ func (q *Queue[T, R]) sendToRingChannel(item ringChannelItem[T]) (err error) {
 }
 
 // send writes enqueued notifications to the writer and retry possible errors if needed.
-func (q *Queue[T, R]) send(ctx context.Context, anyItem any) {
+func (q *Queue[T, R]) send(ctx context.Context, anyItem any, retryHandlersWg *sync.WaitGroup) {
 	item, ok := anyItem.(ringChannelItem[T])
 	if !ok {
 		panic("invalid data type in ring channel")
@@ -162,12 +160,12 @@ func (q *Queue[T, R]) send(ctx context.Context, anyItem any) {
 		return
 	}
 
-	// this is safe because before waiting for the retryHandlersWaitGroup, we wait for the workersWaitGroup. It wouldn't be possible for a retryHandlersWaitGroup.Add to get executed after retryHandlersWaitGroup.wait.
-	q.retryHandlersWaitGroup.Add(1)
+	// this is safe because before waiting for the retryHandlersWg, we wait for the workersWg. It wouldn't be possible for a retryHandlersWg.Add to get executed after retryHandlersWg.wait.
+	retryHandlersWg.Add(1)
 
 	// wait in a separate goroutine to avoid blocking the worker, worker may be able to handle other notifications in the meantime.
 	go func() {
-		defer q.retryHandlersWaitGroup.Done()
+		defer retryHandlersWg.Done()
 
 		select {
 		case <-time.After(waitTime):
@@ -194,11 +192,14 @@ func (q *Queue[T, R]) send(ctx context.Context, anyItem any) {
 
 // start creates the worker goroutines which read enqueued notifications from the ring channel and send them.
 func (q *Queue[T, R]) start(ctx context.Context) {
+	var workersWg sync.WaitGroup
+	var retryHandlersWg sync.WaitGroup
+
 	for i := 0; i < q.options.MaxInFlightRequests; i++ {
-		q.workersWaitGroup.Add(1)
+		workersWg.Add(1)
 
 		go func() {
-			defer q.workersWaitGroup.Done()
+			defer workersWg.Done()
 
 			for {
 				select {
@@ -210,11 +211,17 @@ func (q *Queue[T, R]) start(ctx context.Context) {
 						return
 					}
 
-					q.send(ctx, notification)
+					q.send(ctx, notification, &retryHandlersWg)
 				}
 			}
 		}()
 	}
+
+	go func() {
+		workersWg.Wait()
+		retryHandlersWg.Wait()
+		close(q.doneChannel)
+	}()
 }
 
 // Stop is used to drain the queue and stop worker goroutines.
@@ -233,8 +240,7 @@ func (q *Queue[T, R]) Stop() {
 	// stops worker goroutines
 	q.ctxCancelFunc()
 
-	q.workersWaitGroup.Wait()       // make sure all worker goroutines are done
-	q.retryHandlersWaitGroup.Wait() // make sure all retry handler goroutines are done
+	<-q.doneChannel // make sure all worker goroutines are done
 
 	close(q.errors)
 	close(q.successes)
@@ -261,6 +267,7 @@ func NewQueue[T Notification, R any](writer writer.Writer[T, R], retryHandler re
 		ctxCancelFunc:  ctxCancel,
 		retryHandler:   retryHandler,
 		circuitBreaker: circuitBreaker,
+		doneChannel:    make(chan struct{}),
 	}
 
 	queue.start(ctx)
