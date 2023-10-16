@@ -9,4 +9,4 @@ func (err ConfigurationError) Error() string {
 }
 
 var ErrQueueStopped = errors.New("queue is stopped")
-var ErrInvalidHTTPStatusCode = errors.New("HTTP status code was not valid")
+var ErrCircuitBreakerIsNil = errors.New("circuit breaker is nil")

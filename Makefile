@@ -35,4 +35,6 @@ uninstall-hooks:
 
 .PHONY: generate
 generate: install-mockgen
-	mockgen -source=pkg/notifier/writer.go -destination=pkg/notifier/mock-writer.go -package=notifier
+	mockgen -source=pkg/retry-handler/retry-handler.go -destination=pkg/retry-handler/mock-retry-handler.go -package=retryhandler
+	mockgen -source=pkg/writer/writer.go -destination=pkg/writer/mock-writer.go -package=writer
+	mockgen -source=pkg/circuit-breaker/circuit-breaker.go -destination=pkg/circuit-breaker/mock-circuit-breaker.go -package=circuitbreaker

@@ -12,14 +12,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mhabedinpour/http-notifier/pkg/notifier"
+	circuitbreaker "github.com/mhabedinpour/http-notifier/pkg/circuit-breaker"
+	retryhandler "github.com/mhabedinpour/http-notifier/pkg/retry-handler"
+	"github.com/mhabedinpour/http-notifier/pkg/writer"
 
+	"github.com/mhabedinpour/http-notifier/pkg/notifier"
 	"github.com/muesli/cancelreader"
 	"github.com/sony/gobreaker"
 )
 
 const (
-	DefaultInterval = 1 * time.Second
+	DefaultInterval = 5 * time.Second
 
 	HTTPTimeout = 10 * time.Second
 
@@ -31,27 +34,11 @@ const (
 	StdinBufferSize = 100
 )
 
-func retryHandler(_ notifier.Notification, attempts int, _ error) time.Duration {
-	if attempts >= MaxAttempts {
-		return notifier.NoRetry
-	}
-
-	return RetryWait // we can also use an exponential backoff instead of this constant
-}
-
-func newCB() notifier.CircuitBreaker {
+func newCB() circuitbreaker.CircuitBreaker[[]byte] {
 	var st gobreaker.Settings
 	st.Name = "Notifier"
 
-	cb := gobreaker.NewCircuitBreaker(st)
-
-	return func(req func() error) error {
-		_, err := cb.Execute(func() (interface{}, error) {
-			return nil, req()
-		})
-
-		return err
-	}
+	return circuitbreaker.NewGobreaker[[]byte](st)
 }
 
 // readStdin reads from stdin line by line using a scanner and sends each line to a channel.
@@ -73,7 +60,7 @@ func readStdin(stdin io.Reader, ctxCancel context.CancelFunc) <-chan string {
 }
 
 // enqueueStdin writes the stdin channel to the queue.
-func enqueueStdin(stdinChannel <-chan string, queue *notifier.Queue[notifier.Notification]) {
+func enqueueStdin(stdinChannel <-chan string, queue *notifier.Queue[notifier.Notification, []byte]) {
 	for {
 		select {
 		case notification, ok := <-stdinChannel:
@@ -117,12 +104,10 @@ func main() {
 	interval := flag.Duration("interval", DefaultInterval, "Interval for reading notifications from stdin and sending them")
 	flag.Parse()
 
-	writer := notifier.NewHTTPPostWriter[notifier.Notification](*url, HTTPTimeout)
-	queue, err := notifier.NewQueue[notifier.Notification](writer, notifier.QueueOptions[notifier.Notification]{
+	httpWriter := writer.NewHTTPPostWriter[notifier.Notification](*url, HTTPTimeout)
+	queue, err := notifier.NewQueue[notifier.Notification, []byte](httpWriter, retryhandler.NewConstRetryHandler[notifier.Notification](RetryWait, MaxAttempts), newCB(), notifier.QueueOptions[notifier.Notification]{
 		MaxInFlightRequests:    MaxInFlightRequests,
 		MaxQueuedNotifications: MaxQueuedNotifications,
-		RetryHandler:           retryHandler,
-		CircuitBreaker:         newCB(),
 	})
 	if err != nil {
 		log.Fatalln("could not create queue", err)
@@ -154,12 +139,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
 	ticker := time.NewTicker(*interval)
 	defer stop()
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			ticker.Stop()
-
 			closeStdin() // stop readStdin goroutine by closing its file.
 			// read anything left in the stdin for one last time. enqueueStdin cannot be used here because readStdin goroutine may get blocked when writing to the stdin channel.
 			// if golang runtime schedules enqueueStdin goroutine sooner than the readStdin goroutine, the default case in enqueueStdin will stop the goroutine and there may be some messages left in the stdin.

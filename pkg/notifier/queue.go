@@ -2,9 +2,12 @@ package notifier
 
 import (
 	"context"
-	"io"
 	"sync"
 	"time"
+
+	circuitbreaker "github.com/mhabedinpour/http-notifier/pkg/circuit-breaker"
+	retryhandler "github.com/mhabedinpour/http-notifier/pkg/retry-handler"
+	"github.com/mhabedinpour/http-notifier/pkg/writer"
 
 	"github.com/eapache/channels"
 	"github.com/hashicorp/go-multierror"
@@ -12,22 +15,10 @@ import (
 
 const (
 	QueueNoLimit = -1
-	NoRetry      = time.Duration(0)
 )
 
 // Notification determines types of a message that can be used by the Queue.
-type Notification = io.Reader
-
-// RetryHandler is used to calculate how much to wait before retrying a failed Notification, Return NoRetry to stop retrying.
-type RetryHandler[T Notification] func(notification T, attempts int, err error) time.Duration
-
-// CircuitBreaker is used to implement Circuit Breaker pattern and avoid cascading failures when the down-stream systems are down.
-type CircuitBreaker func(req func() error) error
-
-// NoopCircuitBreaker is a mock circuit breaker.
-func NoopCircuitBreaker(req func() error) error {
-	return req()
-}
+type Notification = writer.Writable
 
 // QueueOptions is options that are accepted and used by the Queue.
 type QueueOptions[T Notification] struct {
@@ -36,10 +27,6 @@ type QueueOptions[T Notification] struct {
 	// MaxQueuedNotifications is the maximum number of notifications allowed to be queued in the internal buffer. Internally a circular buffer is used, When this limit is reached, The oldest element will be removed from the queue.
 	// Use QueueNoLimit to have an infinite queue. Should be higher than 0.
 	MaxQueuedNotifications int
-	// RetryHandler can be used to retry failed notifications. This function should return how much to wait before retrying a failed Notification, Return -1 to stop retrying. Set this to nil to disable retrying.
-	RetryHandler RetryHandler[T]
-	// CircuitBreaker is used to implement the Circuit Breaker pattern and avoid cascading failures when writer is down.
-	CircuitBreaker CircuitBreaker
 }
 
 // Validate makes sure queue options are valid and returns error for invalid options.
@@ -67,6 +54,14 @@ type QueueError[T Notification] struct {
 	Attempts int
 }
 
+// QueueSuccess is used for sending successful notifications to the successes channel to be read by the client.
+type QueueSuccess[T Notification, R any] struct {
+	// Notification is the Notification itself enqueued by the client.
+	Notification T
+	// Result is the result returned by the writer.
+	Result R
+}
+
 // ringChannelItem is used for enqueuing notifications inside the ring channel.
 type ringChannelItem[T Notification] struct {
 	// notification itself
@@ -76,9 +71,9 @@ type ringChannelItem[T Notification] struct {
 }
 
 // Queue can be used to send notifications to the Writer according to the given QueueOptions.
-type Queue[T Notification] struct {
+type Queue[T Notification, R any] struct {
 	// writer is used to send the queued notifications to the external entity.
-	writer Writer[T]
+	writer writer.Writer[T, R]
 	// options are provided user options to control the queue behaviour.
 	options QueueOptions[T]
 	// ringChannel is the channel used for sending jobs to the worker goroutines. This is a ring channel, meaning if the buffer items in the channel, become higher than options.MaxQueuedNotifications, the oldest Notification will be dropped from the buffer.
@@ -86,27 +81,31 @@ type Queue[T Notification] struct {
 	// errors channel is used to send errors to the client. Client must read from this channel, otherwise worker goroutines will get blocked.
 	errors chan QueueError[T]
 	// successes channel is used to notify the client that a Notification has been successfully sent. Client must read from this channel, otherwise goroutine worker goroutines will get blocked.
-	successes chan T
+	successes chan QueueSuccess[T, R]
 	// ctxCancelFunc is used for stopping worker goroutines.
 	ctxCancelFunc context.CancelFunc
 	// workersWaitGroup is used to make sure all worker goroutines are done when stopping the queue.
 	workersWaitGroup sync.WaitGroup
 	// retryHandlersWaitGroup is used to make sure all retry handler goroutines are done when stopping the queue.
 	retryHandlersWaitGroup sync.WaitGroup
+	// retryHandler can be used to retry failed notifications. This function should return how much to wait before retrying a failed Notification, Return NoRetry to stop retrying. Set this to nil to disable retrying.
+	retryHandler retryhandler.RetryHandler[T]
+	// circuitBreaker is used to implement the Circuit Breaker pattern and avoid cascading failures when writer is down.
+	circuitBreaker circuitbreaker.CircuitBreaker[R]
 }
 
 // Errors is used to get the channel for reading errors by the client.
-func (q *Queue[T]) Errors() <-chan QueueError[T] {
+func (q *Queue[T, R]) Errors() <-chan QueueError[T] {
 	return q.errors
 }
 
 // Successes is used by the client to get updates when a Notification has been successfully sent.
-func (q *Queue[T]) Successes() <-chan T {
+func (q *Queue[T, R]) Successes() <-chan QueueSuccess[T, R] {
 	return q.successes
 }
 
 // Enqueue is used for sending new notifications.
-func (q *Queue[T]) Enqueue(notification T) error {
+func (q *Queue[T, R]) Enqueue(notification T) error {
 	return q.sendToRingChannel(ringChannelItem[T]{
 		notification: notification,
 		attempts:     0,
@@ -114,7 +113,7 @@ func (q *Queue[T]) Enqueue(notification T) error {
 }
 
 // sendToRingChannel tries to write the item to the ring channel, If channel is closed, it will return ErrQueueStopped.
-func (q *Queue[T]) sendToRingChannel(item ringChannelItem[T]) (err error) {
+func (q *Queue[T, R]) sendToRingChannel(item ringChannelItem[T]) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = ErrQueueStopped
@@ -127,7 +126,7 @@ func (q *Queue[T]) sendToRingChannel(item ringChannelItem[T]) (err error) {
 }
 
 // send writes enqueued notifications to the writer and retry possible errors if needed.
-func (q *Queue[T]) send(ctx context.Context, anyItem any) {
+func (q *Queue[T, R]) send(ctx context.Context, anyItem any) {
 	item, ok := anyItem.(ringChannelItem[T])
 	if !ok {
 		panic("invalid data type in ring channel")
@@ -135,22 +134,25 @@ func (q *Queue[T]) send(ctx context.Context, anyItem any) {
 
 	item.attempts++
 
-	err := q.options.CircuitBreaker(func() error {
+	result, err := q.circuitBreaker.Execute(func() (R, error) {
 		return q.writer.Write(item.notification)
 	})
 
 	if err == nil {
-		q.successes <- item.notification
+		q.successes <- QueueSuccess[T, R]{
+			Notification: item.notification,
+			Result:       result,
+		}
 
 		return
 	}
 
-	waitTime := NoRetry
-	if q.options.RetryHandler != nil {
-		waitTime = q.options.RetryHandler(item.notification, item.attempts, err)
+	waitTime := retryhandler.NoRetry
+	if q.retryHandler != nil {
+		waitTime = q.retryHandler.CalculateSleep(item.notification, item.attempts, err)
 	}
 
-	if waitTime == NoRetry {
+	if waitTime == retryhandler.NoRetry {
 		q.errors <- QueueError[T]{
 			Notification: item.notification,
 			Err:          err,
@@ -170,8 +172,8 @@ func (q *Queue[T]) send(ctx context.Context, anyItem any) {
 		select {
 		case <-time.After(waitTime):
 			// enqueue again after wait time to be retried
-			err = q.sendToRingChannel(item)
-			if err != nil {
+			sendErr := q.sendToRingChannel(item)
+			if sendErr != nil {
 				// if ring channel was closed, stop retrying and send the last error
 				q.errors <- QueueError[T]{
 					Notification: item.notification,
@@ -191,7 +193,7 @@ func (q *Queue[T]) send(ctx context.Context, anyItem any) {
 }
 
 // start creates the worker goroutines which read enqueued notifications from the ring channel and send them.
-func (q *Queue[T]) start(ctx context.Context) {
+func (q *Queue[T, R]) start(ctx context.Context) {
 	for i := 0; i < q.options.MaxInFlightRequests; i++ {
 		q.workersWaitGroup.Add(1)
 
@@ -216,7 +218,7 @@ func (q *Queue[T]) start(ctx context.Context) {
 }
 
 // Stop is used to drain the queue and stop worker goroutines.
-func (q *Queue[T]) Stop() {
+func (q *Queue[T, R]) Stop() {
 	// prevents writing to the channel
 	q.ringChannel.Close()
 
@@ -239,20 +241,26 @@ func (q *Queue[T]) Stop() {
 }
 
 // NewQueue is the constructor of the Queue.
-func NewQueue[T Notification](writer Writer[T], options QueueOptions[T]) (*Queue[T], error) {
+func NewQueue[T Notification, R any](writer writer.Writer[T, R], retryHandler retryhandler.RetryHandler[T], circuitBreaker circuitbreaker.CircuitBreaker[R], options QueueOptions[T]) (*Queue[T, R], error) {
 	if err := options.Validate(); err != nil {
-		return &Queue[T]{}, err
+		return &Queue[T, R]{}, err
+	}
+
+	if circuitBreaker == nil {
+		return &Queue[T, R]{}, ErrCircuitBreakerIsNil
 	}
 
 	ctx, ctxCancel := context.WithCancel(context.Background())
 	ringChannel := channels.NewRingChannel(channels.BufferCap(options.MaxQueuedNotifications))
-	queue := &Queue[T]{
-		writer:        writer,
-		options:       options,
-		ringChannel:   ringChannel,
-		errors:        make(chan QueueError[T], options.MaxInFlightRequests),
-		successes:     make(chan T, options.MaxInFlightRequests),
-		ctxCancelFunc: ctxCancel,
+	queue := &Queue[T, R]{
+		writer:         writer,
+		options:        options,
+		ringChannel:    ringChannel,
+		errors:         make(chan QueueError[T], options.MaxInFlightRequests),
+		successes:      make(chan QueueSuccess[T, R], options.MaxInFlightRequests),
+		ctxCancelFunc:  ctxCancel,
+		retryHandler:   retryHandler,
+		circuitBreaker: circuitBreaker,
 	}
 
 	queue.start(ctx)
